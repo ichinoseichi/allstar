@@ -33,8 +33,7 @@ type RankRow = {
 
 /* ===== Helpers ===== */
 const rand4 = () => String(Math.floor(1000 + Math.random() * 9000)); // 4桁数字
-const REVEAL_INTERVAL_MS: number =
-  (window as any).REVEAL_INTERVAL_MS ?? 900;
+const REVEAL_INTERVAL_MS: number = (window as any).REVEAL_INTERVAL_MS ?? 900;
 
 /* =======================================================================================
  *                                   共通：部屋状態
@@ -47,7 +46,7 @@ function useRoomCore() {
   const [current, setCurrent] = useState<Round | null>(null);
   const [ranks, setRanks] = useState<RankRow[]>([]);
 
-  // Realtime & initial
+  // 参加者のローカル復元（同タブ再開）
   useEffect(() => {
     const saved = localStorage.getItem("quiz_me");
     if (saved) {
@@ -56,6 +55,7 @@ function useRoomCore() {
     }
   }, []);
 
+  // Realtime購読
   useEffect(() => {
     if (!roomCode) return;
     refreshPlayers();
@@ -84,6 +84,16 @@ function useRoomCore() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [roomCode, current?.id]);
 
+  // Realtime取りこぼし対策：ゆるポーリング
+  useEffect(() => {
+    if (!roomCode) return;
+    const id = window.setInterval(() => {
+      refreshRounds();
+    }, 2500);
+    return () => window.clearInterval(id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [roomCode]);
+
   async function refreshPlayers() {
     if (!roomCode) return;
     const { data, error } = await supabase
@@ -107,14 +117,10 @@ function useRoomCore() {
     const list = (data || []) as Round[];
     setRounds(list);
 
-    setCurrent((prev) => {
+    // ✅ 常に最新ラウンドを current にする（進行不一致対策）
+    setCurrent(() => {
       if (!list.length) return null;
-      const latest = list[list.length - 1];
-      if (!prev) return latest;
-      const same = list.find((r) => r.id === prev.id);
-      if (!same) return latest;
-      if (same.status === "scored" && latest.index_no > same.index_no) return latest;
-      return same;
+      return list[list.length - 1];
     });
 
     const cur = list[list.length - 1];
@@ -182,10 +188,13 @@ function GMPage() {
   // 採点二重防止
   const [isScoring, setIsScoring] = useState(false);
 
-  // ローカル発表演出（GM画面用）
+  // 発表演出（GMローカル）
   const [revealActive, setRevealActive] = useState(false);
   const [revealShown, setRevealShown] = useState(0);
   const revealTimer = useRef<number | null>(null);
+
+  // ラウンド履歴 折りたたみ
+  const [showHistory, setShowHistory] = useState(false);
 
   const correctOnlyRanks = useMemo(() => {
     if (!current?.correct_choice) return [] as RankRow[];
@@ -294,7 +303,7 @@ function GMPage() {
     await refreshRounds();
   }
 
-  // 採点（サーバー側で原子的に一発、二重加点不可）
+  // 採点（サーバー側RPCで原子的に一発、二重加点不可）
   async function applyScores() {
     if (!current || !current.correct_choice) return;
     if (current.status === "scored") return;
@@ -314,7 +323,7 @@ function GMPage() {
     await refreshRounds();
   }
 
-  // 発表開始（全端末へ同期）
+  // 発表開始（全端末へ同期フラグ）
   async function startReveal() {
     if (!current?.correct_choice) return alert("先に正解を選んでください");
     const { error } = await supabase
@@ -334,7 +343,7 @@ function GMPage() {
     await refreshPlayers();
   }
 
-  // トップに戻る
+  // トップへ
   function goTop() {
     try { localStorage.removeItem("quiz_me"); } catch {}
     setRoom(null);
@@ -344,7 +353,7 @@ function GMPage() {
   return (
     <PageWrapper>
       <Header>
-        <span>GMページ</span>
+        <span />
         <div style={{ display: "flex", gap: 8 }}>
           <a href="/player" style={{ ...btn, textDecoration: "none" }}>👤 参加者ページへ</a>
           <button style={btn} onClick={goTop}>🏠 トップに戻る</button>
@@ -392,19 +401,46 @@ function GMPage() {
             )}
           </Box>
 
+          {/* ラウンド履歴：折りたたみ＋スクロール */}
           <Box title="ラウンド履歴">
-            <ul style={{ listStyle: "none", padding: 0, margin: 0 }}>
-              {rounds.map((r) => (
-                <li key={r.id} style={{ border: "1px solid #eee", borderRadius: 8, padding: 8, marginBottom: 6, display: "flex", justifyContent: "space-between" }}>
-                  <div>#{r.index_no} <span style={{ opacity: 0.6 }}>[{r.status}]</span> 正解:{r.correct_choice || "-"} / 発表:{r.reveal_started ? "開始" : "未開始"}</div>
-                  {current?.id !== r.id && (
-                    <button style={btn} onClick={() => { setCurrent(r); refreshRanks(r.id); }}>
-                      このラウンドを見る
-                    </button>
-                  )}
-                </li>
-              ))}
-            </ul>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
+              <span style={{ fontSize: 12, color: "#444" }}>
+                最新が上。邪魔なら隠してOK
+              </span>
+              <button style={btn} onClick={() => setShowHistory((v) => !v)}>
+                {showHistory ? "履歴を隠す" : "履歴を表示"}
+              </button>
+            </div>
+
+            {showHistory && (
+              <div style={{ maxHeight: 220, overflowY: "auto", border: "1px solid #eee", borderRadius: 8, padding: 6 }}>
+                <ul style={{ listStyle: "none", padding: 0, margin: 0 }}>
+                  {rounds
+                    .slice()
+                    .reverse() // 最新上
+                    .map((r) => (
+                      <li
+                        key={r.id}
+                        style={{
+                          borderBottom: "1px solid #f0f0f0",
+                          padding: "6px 4px",
+                          display: "flex",
+                          justifyContent: "space-between",
+                        }}
+                      >
+                        <div>
+                          #{r.index_no} <span style={{ opacity: 0.6 }}>[{r.status}]</span> 正解:{r.correct_choice || "-"} / 発表:{r.reveal_started ? "開始" : "未開始"}
+                        </div>
+                        {current?.id !== r.id && (
+                          <button style={btn} onClick={() => { setCurrent(r); refreshRanks(r.id); }}>
+                            このラウンドを見る
+                          </button>
+                        )}
+                      </li>
+                    ))}
+                </ul>
+              </div>
+            )}
           </Box>
         </Grid2>
       )}
@@ -567,7 +603,7 @@ function PlayerPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // ラウンドが変わったときにだけ自分の回答を取り直す（それ以外でクリアしない）
+  // ラウンドが変わったら“自分の回答表示”を取り直す
   useEffect(() => {
     const cid = current?.id || null;
     if (cid && prevRoundId.current !== cid) {
@@ -586,7 +622,7 @@ function PlayerPage() {
     }
   }, [current?.id, me?.id]);
 
-  // GMが発表を開始したら、参加者でも下から自動発表をスタート
+  // GMが発表を開始したら、参加者でも下から自動発表
   const correctOnlyRanks = useMemo(() => {
     if (!current?.correct_choice) return [] as RankRow[];
     return ranks.filter((r) => r.choice === current.correct_choice);
@@ -670,7 +706,7 @@ function PlayerPage() {
   return (
     <PageWrapper>
       <Header>
-        <span>参加者ページ</span>
+        <span />
         <div style={{ display: "flex", gap: 8 }}>
           <a href="/gm" style={{ ...btn, textDecoration: "none" }}>🎛️ GMページへ</a>
           <button style={btn} onClick={goTop}>🏠 トップに戻る</button>
@@ -705,7 +741,7 @@ function PlayerPage() {
                 // ✅ 毎回初期化（前ラウンドの見た目が残らないように）
                 let style: React.CSSProperties = {
                   ...btnBig,
-                  border: "2px solid #1f2937",
+                  border: "2px solid #0f172a",
                   boxShadow: "none",
                   outline: "none",
                 };
@@ -803,7 +839,7 @@ export default function App() {
   return (
     <PageWrapper>
       <Header>
-        <span>クイズ ツール</span>
+        <span />
       </Header>
       <Grid2>
         <Box title="GM（司会者）の方はこちら">
@@ -831,9 +867,9 @@ const PageWrapper: React.FC<{ children: React.ReactNode }> = ({ children }) => (
   <div
     style={{
       minHeight: "100vh",
-      background: "#f6f7fb",
+      background: "#f5f6fa",
       padding: 16,
-      color: "#111",
+      color: "#0f172a",
       fontFamily: "system-ui, -apple-system, Segoe UI, Roboto, sans-serif",
     }}
   >
@@ -841,9 +877,12 @@ const PageWrapper: React.FC<{ children: React.ReactNode }> = ({ children }) => (
   </div>
 );
 
+// 見出しを小さく＆余白控えめ
 const Header: React.FC<{ children: React.ReactNode }> = ({ children }) => (
-  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", margin: "6px 0 14px" }}>
-    <h1 style={{ margin: 0 }}>オールスター風クイズ（決定版）</h1>
+  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", margin: "2px 0 8px" }}>
+    <h1 style={{ margin: 0, fontSize: 20, fontWeight: 700, lineHeight: 1.2 }}>
+      オールスター風クイズ
+    </h1>
     <div style={{ display: "flex", gap: 8 }}>{children}</div>
   </div>
 );
@@ -863,11 +902,11 @@ const Box: React.FC<{ title?: string; children: React.ReactNode }> = ({ title, c
       borderRadius: 12,
       padding: 14,
       background: "#ffffff",
-      color: "#111",
+      color: "#0f172a",
     }}
   >
     {title && (
-      <h2 style={{ margin: "0 0 8px", fontSize: 16, color: "#111" }}>
+      <h2 style={{ margin: "0 0 8px", fontSize: 16, color: "#0f172a" }}>
         {title}
       </h2>
     )}
